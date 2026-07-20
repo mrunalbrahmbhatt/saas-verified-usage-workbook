@@ -25,8 +25,7 @@ let UserInfo = IdentityInfo
         EmailAddress = tolower(tostring(AccountUpn)),
         DisplayName  = tostring(coalesce(FullName, AccountDisplayName)),
         Department   = tostring(Department),
-        Country      = tostring(coalesce(column_ifexists('Country',''),
-                                         column_ifexists('CountryCode','')));
+        Country      = tostring(Country);
 
 // ── Priority 1: Verified Activity (CloudAppEvents) ────────────────────────
 // Columns used: Timestamp, Application, AccountUpn, AccountName, AccountDomain,
@@ -35,11 +34,11 @@ let AppActivity = union isfuzzy=true
     (CloudAppEvents
      | where Timestamp between (StartTime..EndTime)
      | where isnotempty(Application)
-     // Resolve email from AccountUpn, falling back to AccountName@AccountDomain
+     // Resolve email: use AccountUpn directly, fall back to AccountName@AccountDomain
      | extend EmailAddress = tolower(tostring(coalesce(
-           column_ifexists('AccountUpn',''),
-           iff(isnotempty(tostring(AccountName)) and isnotempty(tostring(AccountDomain)),
-               strcat(tostring(AccountName), '@', tostring(AccountDomain)), ''))))
+           AccountUpn,
+           iff(isnotempty(AccountName) and isnotempty(AccountDomain),
+               strcat(AccountName, '@', AccountDomain), ''))))
      | where isnotempty(EmailAddress) and EmailAddress != '@'
      | project Timestamp, Application, EmailAddress,
                DisplayName = tostring(AccountDisplayName),
