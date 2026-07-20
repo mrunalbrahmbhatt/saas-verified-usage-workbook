@@ -1,0 +1,142 @@
+// =========================================
+// 03-data-quality-gaps.kql
+// Purpose: Data quality and coverage analysis for SaaS verified usage model
+// =========================================
+
+let StartTime = ago(90d);
+let EndTime = now();
+let TargetApps = dynamic([
+    "Ping Identity",
+    "Salesforce Marketing Cloud",
+    "Workday",
+    "Docker"
+]);
+
+let CloudDiscovery =
+    union isfuzzy=true
+    (
+        McasShadowItReporting
+        | where TimeGenerated between (StartTime .. EndTime)
+        | extend
+            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppName", ""), column_ifexists("ApplicationName", ""), column_ifexists("ServiceName", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName", ""), column_ifexists("AccountUpn", ""), column_ifexists("EmailAddress", ""), column_ifexists("User", ""), column_ifexists("Username", "")))),
+            Country = tostring(coalesce(column_ifexists("Country", ""), column_ifexists("CountryCode", ""))),
+            Department = tostring(column_ifexists("Department", ""))
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
+        | project TimeGenerated, Application, EmailAddress, Country, Department
+    ),
+    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string, Country:string, Department:string) []);
+
+let CloudAppActivity =
+    union isfuzzy=true
+    (
+        CloudAppEvents
+        | where TimeGenerated between (StartTime .. EndTime)
+        | extend
+            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppDisplayName", ""), column_ifexists("ApplicationName", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("AccountId", ""), column_ifexists("AccountUpn", ""), column_ifexists("UserPrincipalName", ""))))
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
+        | project TimeGenerated, Application, EmailAddress
+    ),
+    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string) []);
+
+let EntraSignIn =
+    union isfuzzy=true
+    (
+        SigninLogs
+        | where TimeGenerated between (StartTime .. EndTime)
+        | extend
+            Application = tostring(coalesce(column_ifexists("AppDisplayName", ""), column_ifexists("Application", ""), column_ifexists("ResourceDisplayName", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName", ""), column_ifexists("AccountUpn", "")))),
+            IsSuccessful = iff(tolong(coalesce(column_ifexists("ResultType", "0"), "0")) == 0, true, false)
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps)) and IsSuccessful == true
+        | project TimeGenerated, Application, EmailAddress
+    ),
+    (
+        AADSignInEventsBeta
+        | where Timestamp between (StartTime .. EndTime)
+        | extend
+            TimeGenerated = Timestamp,
+            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppDisplayName", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("AccountUpn", ""), column_ifexists("UserPrincipalName", "")))),
+            IsSuccessful = iff(tolong(coalesce(column_ifexists("ErrorCode", "0"), "0")) == 0, true, false)
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps)) and IsSuccessful == true
+        | project TimeGenerated, Application, EmailAddress
+    ),
+    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string) []);
+
+let PingSignIn =
+    union isfuzzy=true
+    (
+        PingIdentity_CL
+        | where TimeGenerated between (StartTime .. EndTime)
+        | extend
+            Application = tostring(coalesce(column_ifexists("AppName_s", ""), column_ifexists("Application_s", ""), column_ifexists("TargetApp_s", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName_s", ""), column_ifexists("Email_s", ""), column_ifexists("Username_s", "")))),
+            Result = tostring(coalesce(column_ifexists("Result_s", ""), column_ifexists("Outcome_s", ""))),
+            EventType = tostring(coalesce(column_ifexists("EventType_s", ""), column_ifexists("Action_s", ""))),
+            IsSuccessful = iff(tolower(Result) in ("success", "succeeded", "ok", "allow", "allowed") and tolower(EventType) has_any ("login", "signin", "authenticate", "sso"), true, false)
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps)) and IsSuccessful == true
+        | project TimeGenerated, Application, EmailAddress
+    ),
+    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string) []);
+
+let AppCoverage =
+    CloudDiscovery
+    | summarize DiscoveryUsers = dcount(EmailAddress) by Application
+    | join kind=leftouter (CloudAppActivity | summarize ActivityUsers = dcount(EmailAddress) by Application) on Application
+    | join kind=leftouter (EntraSignIn | summarize EntraUsers = dcount(EmailAddress) by Application) on Application
+    | join kind=leftouter (PingSignIn | summarize PingUsers = dcount(EmailAddress) by Application) on Application
+    | extend
+        ActivityUsers = coalesce(ActivityUsers, 0),
+        EntraUsers = coalesce(EntraUsers, 0),
+        PingUsers = coalesce(PingUsers, 0),
+        HasVerifiedPath = iff(ActivityUsers + EntraUsers + PingUsers > 0, true, false),
+        GapType = iff(HasVerifiedPath == false, "Cloud Discovery only", "Has verified evidence");
+
+let MissingCountryUsers =
+    CloudDiscovery
+    | where isnotempty(EmailAddress)
+    | summarize LastSeen=max(TimeGenerated), AnyCountry=take_any(Country) by EmailAddress
+    | where isempty(AnyCountry)
+    | summarize CountMissingCountry=dcount(EmailAddress)
+    | project Metric="Users with missing country", Value=CountMissingCountry;
+
+let MissingDepartmentUsers =
+    CloudDiscovery
+    | where isnotempty(EmailAddress)
+    | summarize LastSeen=max(TimeGenerated), AnyDepartment=take_any(Department) by EmailAddress
+    | where isempty(AnyDepartment)
+    | summarize CountMissingDepartment=dcount(EmailAddress)
+    | project Metric="Users with missing department", Value=CountMissingDepartment;
+
+let UrlOnlyApps =
+    AppCoverage
+    | where HasVerifiedPath == false
+    | summarize UrlOnlyAppCount=count()
+    | project Metric="Apps with URL access only", Value=UrlOnlyAppCount;
+
+let TableHealth =
+    union
+        (CloudDiscovery | summarize Rows=count() | extend TableName="McasShadowItReporting"),
+        (CloudAppActivity | summarize Rows=count() | extend TableName="CloudAppEvents"),
+        (EntraSignIn | summarize Rows=count() | extend TableName="SigninLogs/AADSignInEventsBeta"),
+        (PingSignIn | summarize Rows=count() | extend TableName="PingIdentity_CL")
+    | extend Status = iff(Rows > 0, "Data present", "No data in selected range or table unavailable")
+    | project TableName, Rows, Status;
+
+// Result set 1: KPI metrics
+union MissingCountryUsers, MissingDepartmentUsers, UrlOnlyApps
+| order by Metric asc
+;
+
+// Result set 2: Apps seen in discovery but not verified
+AppCoverage
+| where GapType == "Cloud Discovery only"
+| project Application, DiscoveryUsers, ActivityUsers, EntraUsers, PingUsers, GapType
+| order by DiscoveryUsers desc
+;
+
+// Result set 3: Table availability and row counts
+TableHealth
+| order by TableName asc

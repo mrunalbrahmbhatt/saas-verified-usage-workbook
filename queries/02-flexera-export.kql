@@ -1,0 +1,157 @@
+// =========================================
+// 02-flexera-export.kql
+// Purpose: Flexera One SaaS Management export-ready dataset
+// Output columns are exactly aligned to requested export schema.
+// =========================================
+
+let StartTime = ago(90d);
+let EndTime = now();
+let MinimumDaysUsed = 1;
+let TargetApps = dynamic([
+    "Ping Identity",
+    "Salesforce Marketing Cloud",
+    "Workday",
+    "Docker"
+]);
+
+let UserDirectory =
+    union isfuzzy=true
+    (
+        UserInventory_CL
+        | project
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("EmailAddress_s", ""), column_ifexists("UserPrincipalName_s", ""), column_ifexists("UPN_s", "")))),
+            Name = tostring(coalesce(column_ifexists("Name_s", ""), column_ifexists("DisplayName_s", ""), column_ifexists("EmployeeName_s", ""))),
+            Username = tostring(coalesce(column_ifexists("Username_s", ""), column_ifexists("SamAccountName_s", ""), column_ifexists("Alias_s", ""))),
+            Country = tostring(coalesce(column_ifexists("Country_s", ""), column_ifexists("Country", ""))),
+            Department = tostring(coalesce(column_ifexists("Department_s", ""), column_ifexists("Department", "")))
+    ),
+    (datatable(EmailAddress:string, Name:string, Username:string, Country:string, Department:string) []);
+
+let CloudDiscovery =
+    union isfuzzy=true
+    (
+        McasShadowItReporting
+        | where TimeGenerated between (StartTime .. EndTime)
+        | extend
+            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppName", ""), column_ifexists("ApplicationName", ""), column_ifexists("ServiceName", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName", ""), column_ifexists("AccountUpn", ""), column_ifexists("EmailAddress", ""), column_ifexists("User", ""), column_ifexists("Username", "")))),
+            Evidence = "MDCA Discovery",
+            IsSuccessful = bool(null)
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
+        | project TimeGenerated, Application, EmailAddress, Evidence, IsSuccessful
+    ),
+    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string, Evidence:string, IsSuccessful:bool) []);
+
+let CloudAppActivity =
+    union isfuzzy=true
+    (
+        CloudAppEvents
+        | where TimeGenerated between (StartTime .. EndTime)
+        | extend
+            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppDisplayName", ""), column_ifexists("ApplicationName", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("AccountId", ""), column_ifexists("AccountUpn", ""), column_ifexists("UserPrincipalName", "")))),
+            Evidence = "CloudAppEvents",
+            IsSuccessful = true
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
+        | project TimeGenerated, Application, EmailAddress, Evidence, IsSuccessful
+    ),
+    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string, Evidence:string, IsSuccessful:bool) []);
+
+let EntraSignIn =
+    union isfuzzy=true
+    (
+        SigninLogs
+        | where TimeGenerated between (StartTime .. EndTime)
+        | extend
+            Application = tostring(coalesce(column_ifexists("AppDisplayName", ""), column_ifexists("Application", ""), column_ifexists("ResourceDisplayName", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName", ""), column_ifexists("AccountUpn", "")))),
+            IsSuccessful = iff(tolong(coalesce(column_ifexists("ResultType", "0"), "0")) == 0, true, false),
+            Evidence = "Entra ID Sign-in"
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps)) and IsSuccessful == true
+        | project TimeGenerated, Application, EmailAddress, Evidence, IsSuccessful
+    ),
+    (
+        AADSignInEventsBeta
+        | where Timestamp between (StartTime .. EndTime)
+        | extend
+            TimeGenerated = Timestamp,
+            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppDisplayName", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("AccountUpn", ""), column_ifexists("UserPrincipalName", "")))),
+            IsSuccessful = iff(tolong(coalesce(column_ifexists("ErrorCode", "0"), "0")) == 0, true, false),
+            Evidence = "Entra ID Sign-in"
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps)) and IsSuccessful == true
+        | project TimeGenerated, Application, EmailAddress, Evidence, IsSuccessful
+    ),
+    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string, Evidence:string, IsSuccessful:bool) []);
+
+let PingSignIn =
+    union isfuzzy=true
+    (
+        PingIdentity_CL
+        | where TimeGenerated between (StartTime .. EndTime)
+        | extend
+            Application = tostring(coalesce(column_ifexists("AppName_s", ""), column_ifexists("Application_s", ""), column_ifexists("TargetApp_s", ""))),
+            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName_s", ""), column_ifexists("Email_s", ""), column_ifexists("Username_s", "")))),
+            Result = tostring(coalesce(column_ifexists("Result_s", ""), column_ifexists("Outcome_s", ""))),
+            EventType = tostring(coalesce(column_ifexists("EventType_s", ""), column_ifexists("Action_s", ""))),
+            IsSuccessful = iff(tolower(Result) in ("success", "succeeded", "ok", "allow", "allowed") and tolower(EventType) has_any ("login", "signin", "authenticate", "sso"), true, false),
+            Evidence = "Ping Identity Sign-in"
+        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps)) and IsSuccessful == true
+        | project TimeGenerated, Application, EmailAddress, Evidence, IsSuccessful
+    ),
+    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string, Evidence:string, IsSuccessful:bool) []);
+
+let UnifiedUsage =
+    union CloudDiscovery, CloudAppActivity, EntraSignIn, PingSignIn
+    | where isnotempty(EmailAddress)
+    | summarize
+        LastActive = max(TimeGenerated),
+        TotalDaysUsed = dcount(startofday(TimeGenerated)),
+        HasCloudActivity = max(iff(Evidence == "CloudAppEvents", 1, 0)),
+        HasPingSignIn = max(iff(Evidence == "Ping Identity Sign-in", 1, 0)),
+        HasEntraSignIn = max(iff(Evidence == "Entra ID Sign-in", 1, 0)),
+        HasMDCADiscovery = max(iff(Evidence == "MDCA Discovery", 1, 0))
+      by Application, EmailAddress;
+
+UnifiedUsage
+| extend
+    UsageClassification = case(
+        HasCloudActivity == 1, "Verified Activity",
+        HasPingSignIn == 1, "Verified Sign-In",
+        HasEntraSignIn == 1, "Verified Sign-In",
+        HasMDCADiscovery == 1, "URL Access Only",
+        "Unknown"
+    ),
+    ActivityStatus = case(
+        isnull(LastActive), "Unknown",
+        LastActive >= ago(30d), "Active 30d",
+        LastActive >= ago(90d), "Active 90d",
+        LastActive < ago(90d), "Inactive >90d",
+        "Unknown"
+    ),
+    DiscoveryType = case(
+        UsageClassification == "Verified Activity", "Connected App Activity",
+        UsageClassification == "Verified Sign-In", "Identity Verified",
+        UsageClassification == "URL Access Only", "Cloud Discovery",
+        "Unknown"
+    )
+| where TotalDaysUsed >= MinimumDaysUsed
+| where UsageClassification in ("Verified Activity", "Verified Sign-In", "URL Access Only")
+| join kind=leftouter UserDirectory on EmailAddress
+| extend
+    FinalName = coalesce(Name, tostring(split(EmailAddress, "@")[0])),
+    FinalUsername = coalesce(Username, tostring(split(EmailAddress, "@")[0])),
+    FinalCountry = coalesce(Country, ""),
+    FinalDepartment = coalesce(Department, "")
+| project
+    Name = FinalName,
+    ["Email address"] = EmailAddress,
+    Username = FinalUsername,
+    Country = FinalCountry,
+    Department = FinalDepartment,
+    Subscriptions = Application,
+    ["Activity Status"] = ActivityStatus,
+    ["Discovery Type"] = DiscoveryType,
+    ["Last active"] = LastActive,
+    ["Total days used"] = TotalDaysUsed
+| order by ["Last active"] desc, Subscriptions asc
