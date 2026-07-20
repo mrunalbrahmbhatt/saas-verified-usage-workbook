@@ -1,4 +1,4 @@
-// =========================================================================
+﻿// =========================================================================
 // 02-flexera-export.kql
 // Purpose : Flexera One SaaS Management export-ready dataset.
 //           One row per user+application using Defender Advanced Hunting.
@@ -17,45 +17,39 @@ let UserInfo = IdentityInfo
         EmailAddress = tolower(tostring(AccountUpn)),
         DisplayName  = tostring(coalesce(FullName, AccountDisplayName)),
         Department   = tostring(Department),
-        Country      = tostring(coalesce(column_ifexists('Country',''),
-                                         column_ifexists('CountryCode','')));
+        Country      = tostring(coalesce(Country,
+                                         CountryCode));
 // Priority 1: Verified Activity (CloudAppEvents)
 // Columns: Timestamp, Application, AccountUpn, AccountName, AccountDomain, AccountDisplayName, ActionType
-let AppActivity = union isfuzzy=true
+let AppActivity =
     (CloudAppEvents
      | where Timestamp between (StartTime..EndTime)
      | where isnotempty(Application)
      | extend EmailAddress = tolower(tostring(coalesce(
-           column_ifexists('AccountUpn',''),
+           AccountUpn,
            iff(isnotempty(tostring(AccountName)) and isnotempty(tostring(AccountDomain)),
                strcat(tostring(AccountName),'@',tostring(AccountDomain)), ''))))
      | where isnotempty(EmailAddress) and EmailAddress != '@'
-     | project Timestamp, Application, EmailAddress, Evidence='Verified Activity'),
-    (datatable(Timestamp:datetime, Application:string,
-               EmailAddress:string, Evidence:string)[]);
+     | project Timestamp, Application, EmailAddress, Evidence='Verified Activity');
 // Priority 2: Verified Sign-In (EntraIdSignInEvents, ErrorCode=0 = success)
-let EntraSignIn = union isfuzzy=true
+let EntraSignIn =
     (EntraIdSignInEvents
      | where Timestamp between (StartTime..EndTime)
      | where isnotempty(Application) and isnotempty(AccountUpn) and ErrorCode == 0
      | project Timestamp, Application,
                EmailAddress = tolower(tostring(AccountUpn)),
-               Evidence = 'Verified Sign-In'),
-    (datatable(Timestamp:datetime, Application:string,
-               EmailAddress:string, Evidence:string)[]);
+               Evidence = 'Verified Sign-In');
 // Priority 2 fallback: Verified Sign-In (IdentityLogonEvents, LogonSuccess)
-let IdentityLogon = union isfuzzy=true
+let IdentityLogon =
     (IdentityLogonEvents
      | where Timestamp between (StartTime..EndTime)
      | where ActionType == 'LogonSuccess'
      | where isnotempty(Application) and isnotempty(AccountUpn)
      | project Timestamp, Application,
                EmailAddress = tolower(tostring(AccountUpn)),
-               Evidence = 'Verified Sign-In'),
-    (datatable(Timestamp:datetime, Application:string,
-               EmailAddress:string, Evidence:string)[]);
+               Evidence = 'Verified Sign-In');
 // Classify and produce Flexera export columns
-union AppActivity, EntraSignIn, IdentityLogon
+union isfuzzy=true AppActivity, EntraSignIn, IdentityLogon
 | summarize
     LastActive     = max(Timestamp),
     TotalDaysUsed  = dcount(startofday(Timestamp)),
@@ -102,11 +96,11 @@ let UserDirectory =
     (
         UserInventory_CL
         | project
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("EmailAddress_s", ""), column_ifexists("UserPrincipalName_s", ""), column_ifexists("UPN_s", "")))),
-            Name = tostring(coalesce(column_ifexists("Name_s", ""), column_ifexists("DisplayName_s", ""), column_ifexists("EmployeeName_s", ""))),
-            Username = tostring(coalesce(column_ifexists("Username_s", ""), column_ifexists("SamAccountName_s", ""), column_ifexists("Alias_s", ""))),
-            Country = tostring(coalesce(column_ifexists("Country_s", ""), column_ifexists("Country", ""))),
-            Department = tostring(coalesce(column_ifexists("Department_s", ""), column_ifexists("Department", "")))
+            EmailAddress = tolower(tostring(coalesce(EmailAddress_s, UserPrincipalName_s, UPN_s))),
+            Name = tostring(coalesce(Name_s, DisplayName_s, EmployeeName_s)),
+            Username = tostring(coalesce(Username_s, SamAccountName_s, Alias_s)),
+            Country = tostring(coalesce(Country_s, Country)),
+            Department = tostring(coalesce(Department_s, Department))
     ),
     (datatable(EmailAddress:string, Name:string, Username:string, Country:string, Department:string) []);
 
@@ -116,8 +110,8 @@ let CloudDiscovery =
         McasShadowItReporting
         | where TimeGenerated between (StartTime .. EndTime)
         | extend
-            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppName", ""), column_ifexists("ApplicationName", ""), column_ifexists("ServiceName", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName", ""), column_ifexists("AccountUpn", ""), column_ifexists("EmailAddress", ""), column_ifexists("User", ""), column_ifexists("Username", "")))),
+            Application = tostring(coalesce(Application, AppName, ApplicationName, ServiceName)),
+            EmailAddress = tolower(tostring(coalesce(UserPrincipalName, AccountUpn, EmailAddress, User, Username))),
             Evidence = "MDCA Discovery",
             IsSuccessful = bool(null)
         | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
@@ -131,8 +125,8 @@ let CloudAppActivity =
         CloudAppEvents
         | where TimeGenerated between (StartTime .. EndTime)
         | extend
-            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppDisplayName", ""), column_ifexists("ApplicationName", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("AccountId", ""), column_ifexists("AccountUpn", ""), column_ifexists("UserPrincipalName", "")))),
+            Application = tostring(coalesce(Application, AppDisplayName, ApplicationName)),
+            EmailAddress = tolower(tostring(coalesce(AccountId, AccountUpn, UserPrincipalName))),
             Evidence = "CloudAppEvents",
             IsSuccessful = true
         | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
@@ -146,8 +140,8 @@ let EntraSignIn =
         SigninLogs
         | where TimeGenerated between (StartTime .. EndTime)
         | extend
-            Application = tostring(coalesce(column_ifexists("AppDisplayName", ""), column_ifexists("Application", ""), column_ifexists("ResourceDisplayName", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName", ""), column_ifexists("AccountUpn", "")))),
+            Application = tostring(coalesce(AppDisplayName, Application, ResourceDisplayName)),
+            EmailAddress = tolower(tostring(coalesce(UserPrincipalName, AccountUpn))),
             IsSuccessful = iff(tolong(coalesce(column_ifexists("ResultType", "0"), "0")) == 0, true, false),
             Evidence = "Entra ID Sign-in"
         | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps)) and IsSuccessful == true
@@ -158,8 +152,8 @@ let EntraSignIn =
         | where Timestamp between (StartTime .. EndTime)
         | extend
             TimeGenerated = Timestamp,
-            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppDisplayName", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("AccountUpn", ""), column_ifexists("UserPrincipalName", "")))),
+            Application = tostring(coalesce(Application, AppDisplayName)),
+            EmailAddress = tolower(tostring(coalesce(AccountUpn, UserPrincipalName))),
             IsSuccessful = iff(tolong(coalesce(column_ifexists("ErrorCode", "0"), "0")) == 0, true, false),
             Evidence = "Entra ID Sign-in"
         | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps)) and IsSuccessful == true
@@ -173,10 +167,10 @@ let PingSignIn =
         PingIdentity_CL
         | where TimeGenerated between (StartTime .. EndTime)
         | extend
-            Application = tostring(coalesce(column_ifexists("AppName_s", ""), column_ifexists("Application_s", ""), column_ifexists("TargetApp_s", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName_s", ""), column_ifexists("Email_s", ""), column_ifexists("Username_s", "")))),
-            Result = tostring(coalesce(column_ifexists("Result_s", ""), column_ifexists("Outcome_s", ""))),
-            EventType = tostring(coalesce(column_ifexists("EventType_s", ""), column_ifexists("Action_s", ""))),
+            Application = tostring(coalesce(AppName_s, Application_s, TargetApp_s)),
+            EmailAddress = tolower(tostring(coalesce(UserPrincipalName_s, Email_s, Username_s))),
+            Result = tostring(coalesce(Result_s, Outcome_s)),
+            EventType = tostring(coalesce(EventType_s, Action_s)),
             IsSuccessful = iff(tolower(Result) in ("success", "succeeded", "ok", "allow", "allowed") and tolower(EventType) has_any ("login", "signin", "authenticate", "sso"), true, false),
             Evidence = "Ping Identity Sign-in"
         | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps)) and IsSuccessful == true
@@ -238,3 +232,4 @@ UnifiedUsage
     ["Last active"] = LastActive,
     ["Total days used"] = TotalDaysUsed
 | order by ["Last active"] desc, Subscriptions asc
+

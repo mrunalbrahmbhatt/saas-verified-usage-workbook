@@ -73,7 +73,7 @@ let IdentityLogon =
                Evidence     = 'Verified Sign-In';
 
 // ── Combine, classify, enrich ─────────────────────────────────────────────
-union AppActivity, EntraSignIn, IdentityLogon
+union isfuzzy=true AppActivity, EntraSignIn, IdentityLogon
 | summarize
     LastActive      = max(Timestamp),
     TotalDaysUsed   = dcount(startofday(Timestamp)),
