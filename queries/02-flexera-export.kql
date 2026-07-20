@@ -1,13 +1,96 @@
-// =========================================
+// =========================================================================
 // 02-flexera-export.kql
-// Purpose: Flexera One SaaS Management export-ready dataset
-// Output columns are exactly aligned to requested export schema.
-// =========================================
-
+// Purpose : Flexera One SaaS Management export-ready dataset.
+//           One row per user+application using Defender Advanced Hunting.
+//
+// Tables  : CloudAppEvents, EntraIdSignInEvents, IdentityLogonEvents,
+//           IdentityInfo
+// Does NOT use: McasShadowItReporting, SigninLogs, AADSignInEventsBeta
+// =========================================================================
 let StartTime = ago(90d);
-let EndTime = now();
+let EndTime   = now();
 let MinimumDaysUsed = 1;
-let TargetApps = dynamic([
+// User enrichment: most recent IdentityInfo snapshot per account
+let UserInfo = IdentityInfo
+    | summarize arg_max(TimeGenerated, *) by AccountUpn
+    | project
+        EmailAddress = tolower(tostring(AccountUpn)),
+        DisplayName  = tostring(coalesce(FullName, AccountDisplayName)),
+        Department   = tostring(Department),
+        Country      = tostring(coalesce(column_ifexists('Country',''),
+                                         column_ifexists('CountryCode','')));
+// Priority 1: Verified Activity (CloudAppEvents)
+// Columns: Timestamp, Application, AccountUpn, AccountName, AccountDomain, AccountDisplayName, ActionType
+let AppActivity = union isfuzzy=true
+    (CloudAppEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application)
+     | extend EmailAddress = tolower(tostring(coalesce(
+           column_ifexists('AccountUpn',''),
+           iff(isnotempty(tostring(AccountName)) and isnotempty(tostring(AccountDomain)),
+               strcat(tostring(AccountName),'@',tostring(AccountDomain)), ''))))
+     | where isnotempty(EmailAddress) and EmailAddress != '@'
+     | project Timestamp, Application, EmailAddress, Evidence='Verified Activity'),
+    (datatable(Timestamp:datetime, Application:string,
+               EmailAddress:string, Evidence:string)[]);
+// Priority 2: Verified Sign-In (EntraIdSignInEvents, ErrorCode=0 = success)
+let EntraSignIn = union isfuzzy=true
+    (EntraIdSignInEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application) and isnotempty(AccountUpn) and ErrorCode == 0
+     | project Timestamp, Application,
+               EmailAddress = tolower(tostring(AccountUpn)),
+               Evidence = 'Verified Sign-In'),
+    (datatable(Timestamp:datetime, Application:string,
+               EmailAddress:string, Evidence:string)[]);
+// Priority 2 fallback: Verified Sign-In (IdentityLogonEvents, LogonSuccess)
+let IdentityLogon = union isfuzzy=true
+    (IdentityLogonEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where ActionType == 'LogonSuccess'
+     | where isnotempty(Application) and isnotempty(AccountUpn)
+     | project Timestamp, Application,
+               EmailAddress = tolower(tostring(AccountUpn)),
+               Evidence = 'Verified Sign-In'),
+    (datatable(Timestamp:datetime, Application:string,
+               EmailAddress:string, Evidence:string)[]);
+// Classify and produce Flexera export columns
+union AppActivity, EntraSignIn, IdentityLogon
+| summarize
+    LastActive     = max(Timestamp),
+    TotalDaysUsed  = dcount(startofday(Timestamp)),
+    HasAppActivity = max(iff(Evidence == 'Verified Activity', 1, 0)),
+    HasSignIn      = max(iff(Evidence == 'Verified Sign-In', 1, 0))
+    by Application, EmailAddress
+| extend
+    UsageClassification = case(HasAppActivity==1,'Verified Activity',
+                               HasSignIn==1,'Verified Sign-In','Unknown'),
+    ActivityStatus = case(isnull(LastActive),'Unknown',
+                          LastActive>=ago(30d),'Active 30d',
+                          LastActive>=ago(90d),'Active 90d',
+                          LastActive<ago(90d),'Inactive >90d','Unknown'),
+    DiscoveryType  = case(HasAppActivity==1,'Connected App Activity',
+                          HasSignIn==1,'Identity Verified','Unknown')
+| where TotalDaysUsed >= MinimumDaysUsed
+| join kind=leftouter UserInfo on EmailAddress
+| extend
+    DisplayName = coalesce(DisplayName1, tostring(split(EmailAddress,'@')[0])),
+    Department  = coalesce(Department1, ''),
+    Country     = coalesce(Country1, '')
+| project
+    ['Display name']    = DisplayName,
+    ['Email address']   = EmailAddress,
+    Country,
+    Department,
+    Subscriptions       = Application,
+    Classification      = UsageClassification,
+    ['Activity status'] = ActivityStatus,
+    ['Discovery type']  = DiscoveryType,
+    ['Last active']     = LastActive,
+    ['Total days used'] = TotalDaysUsed
+| order by ['Last active'] desc
+// LEGACY CONTENT REMOVED BELOW (kept as reference only)
+// TargetApps = dynamic([
     "Ping Identity",
     "Salesforce Marketing Cloud",
     "Workday",

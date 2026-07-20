@@ -1,11 +1,92 @@
-// =========================================
+// =========================================================================
 // 03-data-quality-gaps.kql
-// Purpose: Data quality and coverage analysis for SaaS verified usage model
-// =========================================
-
+// Purpose : Data quality and gap analysis for Defender-native SaaS usage model.
+//
+// Tables  : CloudAppEvents, EntraIdSignInEvents, IdentityLogonEvents,
+//           IdentityInfo, CloudAuditEvents
+// Does NOT use: McasShadowItReporting, SigninLogs, AADSignInEventsBeta
+// =========================================================================
 let StartTime = ago(90d);
-let EndTime = now();
-let TargetApps = dynamic([
+let EndTime   = now();
+
+// ── Query 1: Apps with sign-in evidence but no CloudAppEvents activity ────
+// These apps are classified as Verified Sign-In only; no app-level actions.
+let ActivityApps = union isfuzzy=true
+    (CloudAppEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application)
+     | extend EmailAddress = tolower(tostring(coalesce(
+           column_ifexists('AccountUpn',''),
+           iff(isnotempty(tostring(AccountName)) and isnotempty(tostring(AccountDomain)),
+               strcat(tostring(AccountName),'@',tostring(AccountDomain)), ''))))
+     | where isnotempty(EmailAddress) and EmailAddress != '@'
+     | project Application, EmailAddress),
+    (datatable(Application:string, EmailAddress:string)[]);
+let SignInApps = union isfuzzy=true
+    (EntraIdSignInEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application) and isnotempty(AccountUpn) and ErrorCode == 0
+     | project Application, EmailAddress=tolower(tostring(AccountUpn))),
+    (IdentityLogonEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where ActionType == 'LogonSuccess' and isnotempty(Application) and isnotempty(AccountUpn)
+     | project Application, EmailAddress=tolower(tostring(AccountUpn))),
+    (datatable(Application:string, EmailAddress:string)[]);
+SignInApps
+| summarize SignInUsers=dcount(EmailAddress) by Application
+| join kind=leftouter (ActivityApps | summarize ActivityUsers=dcount(EmailAddress) by Application) on Application
+| extend ActivityUsers=coalesce(ActivityUsers,0)
+| where ActivityUsers == 0
+| project Application, ['Sign-in users']=SignInUsers, ['Activity users']=ActivityUsers,
+          Gap='Sign-in evidence only - no CloudAppEvents activity recorded'
+| order by ['Sign-in users'] desc;
+
+// ── Query 2: Active users missing IdentityInfo enrichment ─────────────────
+let ActiveUsers = union isfuzzy=true
+    (CloudAppEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application)
+     | extend EmailAddress = tolower(tostring(coalesce(
+           column_ifexists('AccountUpn',''),
+           iff(isnotempty(tostring(AccountName)) and isnotempty(tostring(AccountDomain)),
+               strcat(tostring(AccountName),'@',tostring(AccountDomain)), ''))))
+     | where isnotempty(EmailAddress) and EmailAddress != '@'
+     | project EmailAddress),
+    (EntraIdSignInEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(AccountUpn) and ErrorCode == 0
+     | project EmailAddress=tolower(tostring(AccountUpn))),
+    (datatable(EmailAddress:string)[]);
+let UserInfo = IdentityInfo
+    | summarize arg_max(TimeGenerated, *) by AccountUpn
+    | project EmailAddress=tolower(tostring(AccountUpn)),
+              Department=tostring(Department),
+              Country=tostring(coalesce(column_ifexists('Country',''),
+                                         column_ifexists('CountryCode','')));
+ActiveUsers
+| summarize by EmailAddress
+| join kind=leftouter UserInfo on EmailAddress
+| extend MissingDepartment=iff(isempty(Department),'Yes','No'),
+         MissingCountry=iff(isempty(Country),'Yes','No'),
+         InIdentityInfo=iff(isnotempty(EmailAddress1),'Yes','No')
+| where MissingDepartment=='Yes' or MissingCountry=='Yes' or InIdentityInfo=='No'
+| project ['Email address']=EmailAddress, ['In IdentityInfo']=InIdentityInfo,
+          ['Missing department']=MissingDepartment, ['Missing country']=MissingCountry
+| order by ['Email address'] asc;
+
+// ── Query 3: Table health - row counts in selected range ──────────────────
+union isfuzzy=true
+    (CloudAppEvents      | where Timestamp between (StartTime..EndTime) | summarize Rows=count() | extend TableName='CloudAppEvents'),
+    (EntraIdSignInEvents | where Timestamp between (StartTime..EndTime) | summarize Rows=count() | extend TableName='EntraIdSignInEvents'),
+    (IdentityLogonEvents | where Timestamp between (StartTime..EndTime) | summarize Rows=count() | extend TableName='IdentityLogonEvents'),
+    (IdentityInfo        | summarize Rows=count() | extend TableName='IdentityInfo (snapshot)'),
+    (CloudAuditEvents    | where Timestamp between (StartTime..EndTime) | summarize Rows=count() | extend TableName='CloudAuditEvents')
+| extend Status=iff(Rows>0,'Data present','No data in range or table unavailable')
+| project TableName, Rows, Status
+| order by TableName asc;
+
+// LEGACY CONTENT REMOVED BELOW (kept as reference only)
+// TargetApps = dynamic([
     "Ping Identity",
     "Salesforce Marketing Cloud",
     "Workday",

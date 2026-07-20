@@ -1,0 +1,90 @@
+// =========================================================================
+// 04-validation.kql
+// Purpose : Validation query set to confirm Defender tables are populated
+//           and the evidence model produces expected results.
+//
+// Run each query section independently in Log Analytics / Advanced Hunting.
+// Tables  : CloudAppEvents, EntraIdSignInEvents, IdentityLogonEvents,
+//           IdentityInfo, CloudAuditEvents
+// =========================================================================
+
+// ── Validation 1: Confirm tables exist and have recent data ───────────────
+// Expected: All tables show Rows > 0 and a recent LastRecord timestamp.
+union isfuzzy=true
+    (CloudAppEvents      | summarize Rows=count(), LastRecord=max(Timestamp) | extend TableName='CloudAppEvents'),
+    (EntraIdSignInEvents | summarize Rows=count(), LastRecord=max(Timestamp) | extend TableName='EntraIdSignInEvents'),
+    (IdentityLogonEvents | summarize Rows=count(), LastRecord=max(Timestamp) | extend TableName='IdentityLogonEvents'),
+    (IdentityInfo        | summarize Rows=count(), LastRecord=max(TimeGenerated) | extend TableName='IdentityInfo'),
+    (CloudAuditEvents    | summarize Rows=count(), LastRecord=max(Timestamp) | extend TableName='CloudAuditEvents')
+| extend Status = iff(Rows > 0, 'OK', 'EMPTY - check connector')
+| project TableName, Rows, LastRecord, Status
+| order by TableName asc;
+
+// ── Validation 2: Confirm email address resolves from CloudAppEvents ──────
+// Expected: EmailAddress column is non-empty for most rows.
+// If results are all '@' or empty, AccountName/AccountDomain format is wrong.
+CloudAppEvents
+| where Timestamp > ago(7d)
+| extend EmailAddress = tolower(tostring(coalesce(
+      column_ifexists('AccountUpn',''),
+      iff(isnotempty(tostring(AccountName)) and isnotempty(tostring(AccountDomain)),
+          strcat(tostring(AccountName),'@',tostring(AccountDomain)), ''))))
+| summarize
+    TotalRows         = count(),
+    EmailResolved     = countif(isnotempty(EmailAddress) and EmailAddress != '@'),
+    EmailMissing      = countif(isempty(EmailAddress) or EmailAddress == '@'),
+    UniqueApps        = dcount(Application),
+    UniqueUsers       = dcount(EmailAddress)
+| extend ResolutionRate = round(100.0 * EmailResolved / TotalRows, 1);
+
+// ── Validation 3: Confirm EntraIdSignInEvents has successful sign-ins ─────
+// Expected: SuccessfulSignIns > 0; if 0 check that M365 Defender connector is enabled.
+EntraIdSignInEvents
+| where Timestamp > ago(7d)
+| summarize
+    TotalRows          = count(),
+    SuccessfulSignIns  = countif(ErrorCode == 0),
+    UniqueApps         = dcount(Application),
+    UniqueUsers        = dcount(AccountUpn)
+| extend SuccessRate = round(100.0 * SuccessfulSignIns / TotalRows, 1);
+
+// ── Validation 4: Confirm IdentityInfo has Department and Country ─────────
+// Expected: MissingDept and MissingCountry rates are low.
+// If high, enrich IdentityInfo via Entra ID / HR sync.
+IdentityInfo
+| summarize arg_max(TimeGenerated, *) by AccountUpn
+| summarize
+    TotalUsers      = count(),
+    MissingDept     = countif(isempty(Department)),
+    MissingCountry  = countif(isempty(coalesce(column_ifexists('Country',''), column_ifexists('CountryCode',''))))
+| extend
+    MissingDeptPct    = round(100.0 * MissingDept / TotalUsers, 1),
+    MissingCountryPct = round(100.0 * MissingCountry / TotalUsers, 1);
+
+// ── Validation 5: End-to-end classification spot check (last 30 days) ─────
+// Expected: VerifiedActivity + VerifiedSignIn rows > 0.
+// If all Unknown, check that email resolution (Validation 2) is working.
+let StartTime = ago(30d);
+let EndTime   = now();
+let AppActivity = union isfuzzy=true
+    (CloudAppEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application)
+     | extend EmailAddress = tolower(tostring(coalesce(
+           column_ifexists('AccountUpn',''),
+           iff(isnotempty(tostring(AccountName)) and isnotempty(tostring(AccountDomain)),
+               strcat(tostring(AccountName),'@',tostring(AccountDomain)), ''))))
+     | where isnotempty(EmailAddress) and EmailAddress != '@'
+     | project Application, EmailAddress, Evidence='Verified Activity'),
+    (datatable(Application:string, EmailAddress:string, Evidence:string)[]);
+let EntraSignIn = union isfuzzy=true
+    (EntraIdSignInEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application) and isnotempty(AccountUpn) and ErrorCode == 0
+     | project Application, EmailAddress=tolower(tostring(AccountUpn)), Evidence='Verified Sign-In'),
+    (datatable(Application:string, EmailAddress:string, Evidence:string)[]);
+union AppActivity, EntraSignIn
+| summarize HasActivity=max(iff(Evidence=='Verified Activity',1,0)), HasSignIn=max(iff(Evidence=='Verified Sign-In',1,0)) by Application, EmailAddress
+| extend Classification=case(HasActivity==1,'Verified Activity',HasSignIn==1,'Verified Sign-In','Unknown')
+| summarize Records=count() by Classification
+| order by Records desc;

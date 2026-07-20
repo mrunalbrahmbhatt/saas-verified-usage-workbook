@@ -1,217 +1,121 @@
-// =========================================
+// =========================================================================
 // 01-unified-saas-usage.kql
-// Purpose: Unified SaaS usage model with verification classification
-// Notes:
-// - Uses defensive schema handling with column_ifexists() and coalesce().
-// - Uses union isfuzzy=true so optional/missing tables do not break the query.
-// - Replace PingIdentity_CL column mappings if your custom table differs.
-// =========================================
+// Purpose : Unified SaaS usage model using Defender Advanced Hunting tables.
+//           Returns one row per user+application with classification and
+//           IdentityInfo-enriched attributes.
+//
+// Tables  : CloudAppEvents, EntraIdSignInEvents, IdentityLogonEvents,
+//           IdentityInfo
+// Does NOT use: McasShadowItReporting, SigninLogs, AADSignInEventsBeta
+//
+// Classification priority:
+//   1 – Verified Activity  : CloudAppEvents has an action for this user+app
+//   2 – Verified Sign-In   : EntraIdSignInEvents (ErrorCode=0) or
+//                            IdentityLogonEvents (LogonSuccess)
+//   3 – Unknown            : No evidence in the selected time range
+// =========================================================================
 
-let StartTime = ago(90d);
-let EndTime = now();
-let TargetApps = dynamic([
-    "Ping Identity",
-    "Salesforce Marketing Cloud",
-    "Workday",
-    "Docker"
-]);
+let StartTime = ago(90d);  // adjust or replace with workbook parameter
+let EndTime   = now();
 
-// Optional enrichment table. If not present, this becomes empty.
-let UserDirectory =
-    union isfuzzy=true
-    (
-        UserInventory_CL
-        | project
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("EmailAddress_s", ""), column_ifexists("UserPrincipalName_s", ""), column_ifexists("UPN_s", "")))),
-            Name = tostring(coalesce(column_ifexists("Name_s", ""), column_ifexists("DisplayName_s", ""), column_ifexists("EmployeeName_s", ""))),
-            Username = tostring(coalesce(column_ifexists("Username_s", ""), column_ifexists("SamAccountName_s", ""), column_ifexists("Alias_s", ""))),
-            Country = tostring(coalesce(column_ifexists("Country_s", ""), column_ifexists("Country", ""))),
-            Department = tostring(coalesce(column_ifexists("Department_s", ""), column_ifexists("Department", "")))
-    ),
-    (datatable(EmailAddress:string, Name:string, Username:string, Country:string, Department:string) []);
-
-// 1) CloudDiscovery (URL evidence only, not authentication proof)
-let CloudDiscovery =
-    union isfuzzy=true
-    (
-        McasShadowItReporting
-        | where TimeGenerated between (StartTime .. EndTime)
-        | extend
-            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppName", ""), column_ifexists("ApplicationName", ""), column_ifexists("ServiceName", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName", ""), column_ifexists("AccountUpn", ""), column_ifexists("EmailAddress", ""), column_ifexists("User", ""), column_ifexists("Username", "")))),
-            Name = tostring(coalesce(column_ifexists("UserDisplayName", ""), column_ifexists("DisplayName", ""), column_ifexists("AccountDisplayName", ""))),
-            Username = tostring(coalesce(column_ifexists("Username", ""), column_ifexists("AccountName", ""), split(tostring(column_ifexists("UserPrincipalName", "")), "@")[0])),
-            Country = tostring(coalesce(column_ifexists("Country", ""), column_ifexists("CountryCode", ""))),
-            Department = tostring(column_ifexists("Department", "")),
-            Device = tostring(coalesce(column_ifexists("DeviceName", ""), column_ifexists("Device", ""))),
-            Evidence = "MDCA Discovery",
-            VerificationType = "URL",
-            IsSuccessful = bool(null)
-        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
-        | project TimeGenerated, Application, EmailAddress, Name, Username, Country, Department, Device, Evidence, VerificationType, IsSuccessful
-    ),
-    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string, Name:string, Username:string, Country:string, Department:string, Device:string, Evidence:string, VerificationType:string, IsSuccessful:bool) []);
-
-// 2) CloudAppActivity (connected app activity, strongest evidence)
-let CloudAppActivity =
-    union isfuzzy=true
-    (
-        CloudAppEvents
-        | where TimeGenerated between (StartTime .. EndTime)
-        | extend
-            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppDisplayName", ""), column_ifexists("ApplicationName", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("AccountId", ""), column_ifexists("AccountUpn", ""), column_ifexists("UserPrincipalName", "")))),
-            Name = tostring(coalesce(column_ifexists("AccountDisplayName", ""), column_ifexists("UserDisplayName", ""))),
-            Username = tostring(coalesce(column_ifexists("AccountName", ""), split(tostring(coalesce(column_ifexists("AccountId", ""), column_ifexists("UserPrincipalName", ""))), "@")[0])),
-            Country = tostring(coalesce(column_ifexists("Country", ""), column_ifexists("Location", ""))),
-            Department = tostring(column_ifexists("Department", "")),
-            Device = tostring(coalesce(column_ifexists("DeviceName", ""), column_ifexists("DeviceType", ""))),
-            ActionType = tostring(column_ifexists("ActionType", "")),
-            Evidence = "CloudAppEvents",
-            VerificationType = "Activity",
-            IsSuccessful = true
-        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
-        | project TimeGenerated, Application, EmailAddress, Name, Username, Country, Department, Device, ActionType, Evidence, VerificationType, IsSuccessful
-    ),
-    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string, Name:string, Username:string, Country:string, Department:string, Device:string, ActionType:string, Evidence:string, VerificationType:string, IsSuccessful:bool) []);
-
-// 3) EntraSignIn (fallback verified sign-in when available)
-let EntraSignIn =
-    union isfuzzy=true
-    (
-        SigninLogs
-        | where TimeGenerated between (StartTime .. EndTime)
-        | extend
-            Application = tostring(coalesce(column_ifexists("AppDisplayName", ""), column_ifexists("Application", ""), column_ifexists("ResourceDisplayName", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName", ""), column_ifexists("AccountUpn", "")))),
-            Name = tostring(coalesce(column_ifexists("UserDisplayName", ""), column_ifexists("Identity", ""))),
-            Username = tostring(split(tostring(coalesce(column_ifexists("UserPrincipalName", ""), column_ifexists("AccountUpn", ""))), "@")[0]),
-            Country = tostring(coalesce(column_ifexists("LocationDetails", ""), column_ifexists("Country", ""))),
-            Department = tostring(column_ifexists("Department", "")),
-            ResultType = tostring(coalesce(column_ifexists("ResultType", ""), column_ifexists("ErrorCode", ""))),
-            IsSuccessful = iff(tolong(coalesce(column_ifexists("ResultType", "0"), "0")) == 0, true, false),
-            Evidence = "Entra ID Sign-in",
-            VerificationType = "SignIn"
-        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
-        | project TimeGenerated, Application, EmailAddress, Name, Username, Country, Department, ResultType, Evidence, VerificationType, IsSuccessful
-    ),
-    (
-        AADSignInEventsBeta
-        | where Timestamp between (StartTime .. EndTime)
-        | extend
-            TimeGenerated = Timestamp,
-            Application = tostring(coalesce(column_ifexists("Application", ""), column_ifexists("AppDisplayName", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("AccountUpn", ""), column_ifexists("UserPrincipalName", "")))),
-            Name = tostring(column_ifexists("AccountDisplayName", "")),
-            Username = tostring(split(tostring(coalesce(column_ifexists("AccountUpn", ""), column_ifexists("UserPrincipalName", ""))), "@")[0]),
-            Country = tostring(column_ifexists("Country", "")),
-            Department = tostring(column_ifexists("Department", "")),
-            ResultType = tostring(coalesce(column_ifexists("ErrorCode", ""), column_ifexists("ResultType", ""))),
-            IsSuccessful = iff(tolong(coalesce(column_ifexists("ErrorCode", "0"), "0")) == 0, true, false),
-            Evidence = "Entra ID Sign-in",
-            VerificationType = "SignIn"
-        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
-        | project TimeGenerated, Application, EmailAddress, Name, Username, Country, Department, ResultType, Evidence, VerificationType, IsSuccessful
-    ),
-    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string, Name:string, Username:string, Country:string, Department:string, ResultType:string, Evidence:string, VerificationType:string, IsSuccessful:bool) []);
-
-// 4) PingSignIn (custom table, adjust mappings to your schema)
-let PingSignIn =
-    union isfuzzy=true
-    (
-        PingIdentity_CL
-        | where TimeGenerated between (StartTime .. EndTime)
-        | extend
-            Application = tostring(coalesce(column_ifexists("AppName_s", ""), column_ifexists("Application_s", ""), column_ifexists("TargetApp_s", ""))),
-            EmailAddress = tolower(tostring(coalesce(column_ifexists("UserPrincipalName_s", ""), column_ifexists("Email_s", ""), column_ifexists("Username_s", "")))),
-            Name = tostring(coalesce(column_ifexists("DisplayName_s", ""), column_ifexists("Name_s", ""))),
-            Username = tostring(coalesce(column_ifexists("Username_s", ""), split(tostring(column_ifexists("UserPrincipalName_s", "")), "@")[0])),
-            Country = tostring(column_ifexists("Country_s", "")),
-            Department = tostring(column_ifexists("Department_s", "")),
-            Result = tostring(coalesce(column_ifexists("Result_s", ""), column_ifexists("Outcome_s", ""))),
-            EventType = tostring(coalesce(column_ifexists("EventType_s", ""), column_ifexists("Action_s", ""))),
-            IsSuccessful = iff(tolower(Result) in ("success", "succeeded", "ok", "allow", "allowed") and tolower(EventType) has_any ("login", "signin", "authenticate", "sso"), true, false),
-            Evidence = "Ping Identity Sign-in",
-            VerificationType = "SignIn"
-        | where isnotempty(Application) and (array_length(TargetApps) == 0 or Application in (TargetApps))
-        | project TimeGenerated, Application, EmailAddress, Name, Username, Country, Department, Result, EventType, Evidence, VerificationType, IsSuccessful
-    ),
-    (datatable(TimeGenerated:datetime, Application:string, EmailAddress:string, Name:string, Username:string, Country:string, Department:string, Result:string, EventType:string, Evidence:string, VerificationType:string, IsSuccessful:bool) []);
-
-// 5) UnifiedUsage
-let UnifiedUsage =
-    union
-        (CloudDiscovery | extend SourcePriority = 1),
-        (CloudAppActivity | extend SourcePriority = 4),
-        (EntraSignIn | where IsSuccessful == true | extend SourcePriority = 3),
-        (PingSignIn | where IsSuccessful == true | extend SourcePriority = 3)
-    | where isnotempty(Application)
-    | where isnotempty(EmailAddress)
-    | summarize
-        LastActive = max(TimeGenerated),
-        TotalDaysUsed = dcount(startofday(TimeGenerated)),
-        HasCloudActivity = max(iff(Evidence == "CloudAppEvents", 1, 0)),
-        HasPingSignIn = max(iff(Evidence == "Ping Identity Sign-in", 1, 0)),
-        HasEntraSignIn = max(iff(Evidence == "Entra ID Sign-in", 1, 0)),
-        HasMDCADiscovery = max(iff(Evidence == "MDCA Discovery", 1, 0)),
-        EvidenceSource = make_set(Evidence, 10),
-        AnyName = take_any(Name),
-        AnyUsername = take_any(Username),
-        AnyCountry = take_any(Country),
-        AnyDepartment = take_any(Department)
-      by Application, EmailAddress;
-
-// 6) FinalClassification
-let FinalClassification =
-    UnifiedUsage
-    | extend
-        UsageClassification = case(
-            HasCloudActivity == 1, "Verified Activity",
-            HasPingSignIn == 1, "Verified Sign-In",
-            HasEntraSignIn == 1, "Verified Sign-In",
-            HasMDCADiscovery == 1, "URL Access Only",
-            "Unknown"
-        ),
-        ClassificationReason = case(
-            HasCloudActivity == 1, "CloudAppEvents activity exists for this user and app.",
-            HasPingSignIn == 1, "Ping Identity successful sign-in exists for this user and app.",
-            HasEntraSignIn == 1, "Entra ID successful sign-in exists for this user and app.",
-            HasMDCADiscovery == 1, "Only MDCA URL discovery evidence exists.",
-            "No matching evidence found in selected range."
-        ),
-        ActivityStatus = case(
-            isnull(LastActive), "Unknown",
-            LastActive >= ago(30d), "Active 30d",
-            LastActive >= ago(90d), "Active 90d",
-            LastActive < ago(90d), "Inactive >90d",
-            "Unknown"
-        ),
-        DiscoveryType = case(
-            UsageClassification == "Verified Activity", "Connected App Activity",
-            UsageClassification == "Verified Sign-In", "Identity Verified",
-            UsageClassification == "URL Access Only", "Cloud Discovery",
-            "Unknown"
-        )
-    | join kind=leftouter UserDirectory on EmailAddress
-    | extend
-        Name = coalesce(Name1, AnyName),
-        Username = coalesce(Username1, AnyUsername),
-        Country = coalesce(Country1, AnyCountry),
-        Department = coalesce(Department1, AnyDepartment)
+// ── User enrichment: most recent IdentityInfo snapshot per account ────────
+let UserInfo = IdentityInfo
+    | summarize arg_max(TimeGenerated, *) by AccountUpn
     | project
-        Name,
-        ["Email address"] = EmailAddress,
-        Username,
-        Country,
-        Department,
-        Application,
-        ["Activity Status"] = ActivityStatus,
-        ["Discovery Type"] = DiscoveryType,
-        ["Usage Classification"] = UsageClassification,
-        ["Classification Reason"] = ClassificationReason,
-        ["Last active"] = LastActive,
-        ["Total days used"] = TotalDaysUsed,
-        ["Evidence Source"] = tostring(EvidenceSource);
+        EmailAddress = tolower(tostring(AccountUpn)),
+        DisplayName  = tostring(coalesce(FullName, AccountDisplayName)),
+        Department   = tostring(Department),
+        Country      = tostring(coalesce(column_ifexists('Country',''),
+                                         column_ifexists('CountryCode','')));
 
-FinalClassification
-| order by ["Last active"] desc, Application asc
+// ── Priority 1: Verified Activity (CloudAppEvents) ────────────────────────
+// Columns used: Timestamp, Application, AccountUpn, AccountName, AccountDomain,
+//               AccountDisplayName, ActionType
+let AppActivity = union isfuzzy=true
+    (CloudAppEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application)
+     // Resolve email from AccountUpn, falling back to AccountName@AccountDomain
+     | extend EmailAddress = tolower(tostring(coalesce(
+           column_ifexists('AccountUpn',''),
+           iff(isnotempty(tostring(AccountName)) and isnotempty(tostring(AccountDomain)),
+               strcat(tostring(AccountName), '@', tostring(AccountDomain)), ''))))
+     | where isnotempty(EmailAddress) and EmailAddress != '@'
+     | project Timestamp, Application, EmailAddress,
+               DisplayName = tostring(AccountDisplayName),
+               ActionType,
+               Evidence = 'Verified Activity'),
+    (datatable(Timestamp:datetime, Application:string, EmailAddress:string,
+               DisplayName:string, ActionType:string, Evidence:string)[]);
+
+// ── Priority 2: Verified Sign-In (EntraIdSignInEvents) ───────────────────
+// Columns used: Timestamp, Application, AccountUpn, AccountDisplayName, ErrorCode
+let EntraSignIn = union isfuzzy=true
+    (EntraIdSignInEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application) and isnotempty(AccountUpn)
+     | where ErrorCode == 0   // 0 = successful authentication
+     | project Timestamp, Application,
+               EmailAddress = tolower(tostring(AccountUpn)),
+               DisplayName  = tostring(AccountDisplayName),
+               ActionType   = 'SignInSuccess',
+               Evidence     = 'Verified Sign-In'),
+    (datatable(Timestamp:datetime, Application:string, EmailAddress:string,
+               DisplayName:string, ActionType:string, Evidence:string)[]);
+
+// ── Priority 2 fallback: Verified Sign-In (IdentityLogonEvents) ──────────
+// Note: Application field in IdentityLogonEvents may be empty for cloud-only SaaS.
+// Columns used: Timestamp, ActionType, Application, AccountUpn, AccountDisplayName
+let IdentityLogon = union isfuzzy=true
+    (IdentityLogonEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where ActionType == 'LogonSuccess'
+     | where isnotempty(Application) and isnotempty(AccountUpn)
+     | project Timestamp, Application,
+               EmailAddress = tolower(tostring(AccountUpn)),
+               DisplayName  = tostring(AccountDisplayName),
+               ActionType,
+               Evidence     = 'Verified Sign-In'),
+    (datatable(Timestamp:datetime, Application:string, EmailAddress:string,
+               DisplayName:string, ActionType:string, Evidence:string)[]);
+
+// ── Combine, classify, enrich ─────────────────────────────────────────────
+union AppActivity, EntraSignIn, IdentityLogon
+| summarize
+    LastActive      = max(Timestamp),
+    TotalDaysUsed   = dcount(startofday(Timestamp)),
+    HasAppActivity  = max(iff(Evidence == 'Verified Activity', 1, 0)),
+    HasSignIn       = max(iff(Evidence == 'Verified Sign-In', 1, 0)),
+    EvidenceSources = make_set(Evidence, 5),
+    SampleActions   = make_set(ActionType, 5),
+    AnyDisplayName  = take_any(DisplayName)
+    by Application, EmailAddress
+| extend
+    UsageClassification = case(
+        HasAppActivity == 1, 'Verified Activity',
+        HasSignIn == 1,      'Verified Sign-In',
+                             'Unknown'),
+    ActivityStatus = case(
+        isnull(LastActive),     'Unknown',
+        LastActive >= ago(30d), 'Active 30d',
+        LastActive >= ago(90d), 'Active 90d',
+        LastActive < ago(90d),  'Inactive >90d',
+        'Unknown')
+| join kind=leftouter UserInfo on EmailAddress
+| extend
+    DisplayName = coalesce(DisplayName1, AnyDisplayName),
+    Department  = coalesce(Department1, ''),
+    Country     = coalesce(Country1, '')
+| project
+    Application,
+    EmailAddress,
+    DisplayName,
+    Department,
+    Country,
+    UsageClassification,
+    ActivityStatus,
+    LastActive,
+    TotalDaysUsed,
+    EvidenceSources = tostring(EvidenceSources),
+    SampleActions   = tostring(SampleActions)
+| order by LastActive desc
