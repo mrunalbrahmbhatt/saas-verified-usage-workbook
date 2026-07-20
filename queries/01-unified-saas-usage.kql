@@ -30,8 +30,8 @@ let UserInfo = IdentityInfo
 // ── Priority 1: Verified Activity (CloudAppEvents) ────────────────────────
 // Columns used: Timestamp, Application, AccountUpn, AccountName, AccountDomain,
 //               AccountDisplayName, ActionType
-let AppActivity = union isfuzzy=true
-    (CloudAppEvents
+let AppActivity =
+    CloudAppEvents
      | where Timestamp between (StartTime..EndTime)
      | where isnotempty(Application)
      // Resolve email: use AccountUpn directly, fall back to AccountName@AccountDomain
@@ -43,14 +43,12 @@ let AppActivity = union isfuzzy=true
      | project Timestamp, Application, EmailAddress,
                DisplayName = tostring(AccountDisplayName),
                ActionType,
-               Evidence = 'Verified Activity'),
-    (datatable(Timestamp:datetime, Application:string, EmailAddress:string,
-               DisplayName:string, ActionType:string, Evidence:string)[]);
+               Evidence = 'Verified Activity';
 
 // ── Priority 2: Verified Sign-In (EntraIdSignInEvents) ───────────────────
 // Columns used: Timestamp, Application, AccountUpn, AccountDisplayName, ErrorCode
-let EntraSignIn = union isfuzzy=true
-    (EntraIdSignInEvents
+let EntraSignIn =
+    EntraIdSignInEvents
      | where Timestamp between (StartTime..EndTime)
      | where isnotempty(Application) and isnotempty(AccountUpn)
      | where ErrorCode == 0   // 0 = successful authentication
@@ -58,15 +56,13 @@ let EntraSignIn = union isfuzzy=true
                EmailAddress = tolower(tostring(AccountUpn)),
                DisplayName  = tostring(AccountDisplayName),
                ActionType   = 'SignInSuccess',
-               Evidence     = 'Verified Sign-In'),
-    (datatable(Timestamp:datetime, Application:string, EmailAddress:string,
-               DisplayName:string, ActionType:string, Evidence:string)[]);
+               Evidence     = 'Verified Sign-In';
 
 // ── Priority 2 fallback: Verified Sign-In (IdentityLogonEvents) ──────────
 // Note: Application field in IdentityLogonEvents may be empty for cloud-only SaaS.
 // Columns used: Timestamp, ActionType, Application, AccountUpn, AccountDisplayName
-let IdentityLogon = union isfuzzy=true
-    (IdentityLogonEvents
+let IdentityLogon =
+    IdentityLogonEvents
      | where Timestamp between (StartTime..EndTime)
      | where ActionType == 'LogonSuccess'
      | where isnotempty(Application) and isnotempty(AccountUpn)
@@ -74,9 +70,7 @@ let IdentityLogon = union isfuzzy=true
                EmailAddress = tolower(tostring(AccountUpn)),
                DisplayName  = tostring(AccountDisplayName),
                ActionType,
-               Evidence     = 'Verified Sign-In'),
-    (datatable(Timestamp:datetime, Application:string, EmailAddress:string,
-               DisplayName:string, ActionType:string, Evidence:string)[]);
+               Evidence     = 'Verified Sign-In';
 
 // ── Combine, classify, enrich ─────────────────────────────────────────────
 union AppActivity, EntraSignIn, IdentityLogon
