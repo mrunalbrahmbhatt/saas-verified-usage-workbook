@@ -15,10 +15,9 @@ let UserInfo = IdentityInfo
     | summarize arg_max(TimeGenerated, *) by AccountUpn
     | project
         EmailAddress = tolower(tostring(AccountUpn)),
-        DisplayName  = tostring(coalesce(FullName, AccountDisplayName)),
+        DisplayName  = tostring(AccountDisplayName),
         Department   = tostring(Department),
-        Country      = tostring(coalesce(Country,
-                                         CountryCode));
+        Country      = tostring(Country);
 // Priority 1: Verified Activity (CloudAppEvents)
 // Columns: Timestamp, Application, AccountUpn, AccountName, AccountDomain, AccountDisplayName, ActionType
 let AppActivity =

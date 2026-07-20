@@ -23,7 +23,7 @@ let UserInfo = IdentityInfo
     | summarize arg_max(TimeGenerated, *) by AccountUpn
     | project
         EmailAddress = tolower(tostring(AccountUpn)),
-        DisplayName  = tostring(coalesce(FullName, AccountDisplayName)),
+        DisplayName  = tostring(AccountDisplayName),
         Department   = tostring(Department),
         Country      = tostring(Country);
 
