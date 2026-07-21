@@ -19,61 +19,57 @@ let StartTime = ago(90d);  // adjust or replace with workbook parameter
 let EndTime   = now();
 
 // ── User enrichment: most recent IdentityInfo snapshot per account ────────
-let UserInfo = IdentityInfo
-    | summarize arg_max(TimeGenerated, *) by AccountUpn
-    | project
-        EmailAddress = tolower(tostring(AccountUpn)),
-        DisplayName  = tostring(AccountDisplayName),
-        Department   = tostring(Department),
-        Country      = tostring(Country);
-
-// ── Priority 1: Verified Activity (CloudAppEvents) ────────────────────────
-// Columns used: Timestamp, Application, AccountUpn, AccountName, AccountDomain,
-//               AccountDisplayName, ActionType
-let AppActivity =
-    CloudAppEvents
-     | where Timestamp between (StartTime..EndTime)
-     | where isnotempty(Application)
-     // Resolve email: use AccountUpn directly, fall back to AccountName@AccountDomain
-     | extend EmailAddress = tolower(tostring(coalesce(
-           AccountUpn,
-           iff(isnotempty(AccountName) and isnotempty(AccountDomain),
-               strcat(AccountName, '@', AccountDomain), ''))))
-     | where isnotempty(EmailAddress) and EmailAddress != '@'
-     | project Timestamp, Application, EmailAddress,
-               DisplayName = tostring(AccountDisplayName),
-               ActionType,
-               Evidence = 'Verified Activity';
-
-// ── Priority 2: Verified Sign-In (EntraIdSignInEvents) ───────────────────
-// Columns used: Timestamp, Application, AccountUpn, AccountDisplayName, ErrorCode
-let EntraSignIn =
-    EntraIdSignInEvents
-     | where Timestamp between (StartTime..EndTime)
-     | where isnotempty(Application) and isnotempty(AccountUpn)
-     | where ErrorCode == 0   // 0 = successful authentication
-     | project Timestamp, Application,
-               EmailAddress = tolower(tostring(AccountUpn)),
-               DisplayName  = tostring(AccountDisplayName),
-               ActionType   = 'SignInSuccess',
-               Evidence     = 'Verified Sign-In';
-
-// ── Priority 2 fallback: Verified Sign-In (IdentityLogonEvents) ──────────
-// Note: Application field in IdentityLogonEvents may be empty for cloud-only SaaS.
-// Columns used: Timestamp, ActionType, Application, AccountUpn, AccountDisplayName
-let IdentityLogon =
-    IdentityLogonEvents
-     | where Timestamp between (StartTime..EndTime)
-     | where ActionType == 'LogonSuccess'
-     | where isnotempty(Application) and isnotempty(AccountUpn)
-     | project Timestamp, Application,
-               EmailAddress = tolower(tostring(AccountUpn)),
-               DisplayName  = tostring(AccountDisplayName),
-               ActionType,
-               Evidence     = 'Verified Sign-In';
+// Optional: if IdentityInfo doesn't exist or has missing columns, returns empty
+// table with correct schema so joins don't fail.
+let UserInfo = 
+    union isfuzzy=true
+    (IdentityInfo
+     | summarize arg_max(column_ifexists('TimeGenerated', now()), *) by column_ifexists('AccountUpn', '')
+     | project
+         EmailAddress = tolower(tostring(column_ifexists('AccountUpn', ''))),
+         DisplayName  = tostring(column_ifexists('AccountDisplayName', '')),
+         Department   = tostring(column_ifexists('Department', '')),
+         Country      = tostring(column_ifexists('Country', ''))),
+    (datatable(EmailAddress: string, DisplayName: string, Department: string, Country: string)[])
 
 // ── Combine, classify, enrich ─────────────────────────────────────────────
-union isfuzzy=true AppActivity, EntraSignIn, IdentityLogon
+// Each branch is inlined so isfuzzy=true can skip any table that doesn't exist
+// in the current workspace without failing the whole query.
+union isfuzzy=true
+    // Priority 1: Verified Activity (CloudAppEvents)
+    (CloudAppEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application)
+     | extend EmailAddress = tolower(tostring(coalesce(
+           column_ifexists('AccountUpn', ''),
+           iff(isnotempty(column_ifexists('AccountName', '')) and isnotempty(column_ifexists('AccountDomain', '')),
+               strcat(column_ifexists('AccountName', ''), '@', column_ifexists('AccountDomain', '')), ''))))
+     | where isnotempty(EmailAddress) and EmailAddress != '@'
+     | project Timestamp, Application, EmailAddress,
+               DisplayName = tostring(column_ifexists('AccountDisplayName', '')),
+               ActionType  = tostring(column_ifexists('ActionType', '')),
+               Evidence    = 'Verified Activity'),
+    // Priority 2: Verified Sign-In (EntraIdSignInEvents)
+    (EntraIdSignInEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where isnotempty(Application) and isnotempty(column_ifexists('AccountUpn', ''))
+     | where column_ifexists('ErrorCode', -1) == 0   // 0 = successful authentication
+     | project Timestamp, Application,
+               EmailAddress = tolower(tostring(column_ifexists('AccountUpn', ''))),
+               DisplayName  = tostring(column_ifexists('AccountDisplayName', '')),
+               ActionType   = 'SignInSuccess',
+               Evidence     = 'Verified Sign-In'),
+    // Priority 2 fallback: Verified Sign-In (IdentityLogonEvents)
+    // Note: Application may be empty for cloud-only SaaS.
+    (IdentityLogonEvents
+     | where Timestamp between (StartTime..EndTime)
+     | where column_ifexists('ActionType', '') == 'LogonSuccess'
+     | where isnotempty(Application) and isnotempty(column_ifexists('AccountUpn', ''))
+     | project Timestamp, Application,
+               EmailAddress = tolower(tostring(column_ifexists('AccountUpn', ''))),
+               DisplayName  = tostring(column_ifexists('AccountDisplayName', '')),
+               ActionType   = tostring(column_ifexists('ActionType', '')),
+               Evidence     = 'Verified Sign-In')
 | summarize
     LastActive      = max(Timestamp),
     TotalDaysUsed   = dcount(startofday(Timestamp)),
