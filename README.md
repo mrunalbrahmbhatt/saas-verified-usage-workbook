@@ -1,64 +1,63 @@
-# SaaS Verified Usage and Flexera Export Workbook
+# Verified SaaS Usage – Identity Journey (Microsoft Sentinel Workbook)
 
-## Purpose
-This solution provides trusted, user-level SaaS usage visibility in Microsoft Sentinel and prepares export-ready data for Flexera One SaaS Management. It separates simple URL discovery from verified sign-in and verified in-app activity.
+An Azure Monitor / Microsoft Sentinel workbook that answers one ITAM question for **cba**:
 
-## Architecture
-The workbook and KQL model unify evidence from Cloud Discovery, cloud app activity, and identity sign-in sources.
+> *For each SaaS application, which users are really using it — and is that usage backed by a verified corporate sign-in (MFA / Conditional Access) or not?*
 
-Evidence layers:
-1. URL evidence from MDCA Cloud Discovery (McasShadowItReporting).
-2. Verified application activity from CloudAppEvents.
-3. Verified sign-in from Ping Identity custom logs (PingIdentity_CL) when available.
-4. Verified sign-in fallback from Entra sign-in logs (SigninLogs or AADSignInEventsBeta).
+It presents the same **App × User** question through **four complementary approaches** side by side, so you can compare what Entra sign-in logs say against what Defender for Cloud Apps (MDA) activity says, and reconcile the two.
 
-Classification precedence:
-1. Verified Activity
-2. Verified Sign-In
-3. URL Access Only
-4. Unknown
+## Files
 
-## Required data sources
-- McasShadowItReporting (Cloud Discovery / Shadow IT)
+| File | Purpose |
+|------|---------|
+| `Sentinel-Identity-Dashboard.workbook.json` | The workbook. Import via **Workbooks → New → Advanced Editor**. |
 
-## Optional data sources
-- CloudAppEvents (Defender for Cloud Apps activity for connected apps)
-- SigninLogs or AADSignInEventsBeta (Entra sign-in evidence)
-- PingIdentity_CL (custom Ping Identity logs)
-- UserInventory_CL (optional enrichment for name, country, department)
+## The four approaches
 
-## Table mapping
-- McasShadowItReporting: URL access/discovery evidence
-- CloudAppEvents: API/activity evidence
-- SigninLogs or AADSignInEventsBeta: identity sign-in evidence
-- PingIdentity_CL: identity sign-in evidence (custom connector)
-- UserInventory_CL: HR/user profile enrichment (optional)
+| # | Section | Source | Signal |
+|---|---------|--------|--------|
+| **A** | Union (Interactive + Non-interactive) · App × User Journey | `SigninLogs` ∪ `AADNonInteractiveUserSignInLogs` | Full journey: Sign-in → MFA → MFA Method → Conditional Access → Recency |
+| **B** | Non-interactive sign-ins (direct) | `AADNonInteractiveUserSignInLogs` | Leanest path (no `union`/`mv-expand`); a fallback to confirm data flows |
+| **C** | MDA activity (direct) | `CloudAppEvents` | `MDCAActivity` = user performed an in-app action captured by MDCA in range. Covers non-Entra apps |
+| **D** | MDA × Entra cross-reference | `CloudAppEvents` ⨝ Entra sign-ins | `AccessType` = **Authenticated** (matching corporate sign-in) vs **Unauthenticated** |
 
-## Workbook sections
-1. Executive Summary
-2. SaaS Application Summary
-3. User-Level SaaS Inventory
-4. Verification Evidence
-5. Flexera Export
-6. Data Quality and Gaps
+Two **data-availability** tiles (Entra and MDA) show row/user/app counts per source so you can see at a glance which tables are actually ingesting data in the selected workspace.
+
+## Filters
+
+Filters are pills at the top and cascade top-to-bottom. **Select Workspace and Time Range first**; the query-backed pills then populate.
+
+| Filter | Type | Notes |
+|--------|------|-------|
+| **Workspace** | Azure Resource Graph | Pick the Log Analytics / Sentinel workspace. |
+| **Time Range** | Duration | 24h / 7d / 30d / 90d / custom. Scopes every table and the recency logic. |
+| **User (type UPN or name)** | Free text | Partial, case-insensitive `contains` match. Free text (not a dropdown) because there are thousands of users. Leave blank for all. |
+| **Application** | Multi-select | Populated from Entra `AppDisplayName`. Tick the 5–10 apps of interest, or leave **All**. |
+| **Sign-in Status** | All / Success / Failure | Applies to Approaches A/B. |
+| **Access Type** | All / Authenticated / Unauthenticated | Applies to Approach D. |
+
+### Cross-taxonomy app matching (A/B vs C/D)
+
+The **Application** list comes from **Entra** sign-in names (e.g. *Microsoft 365 Admin portal*), but MDA (`CloudAppEvents.Application`) often uses different names (e.g. *Microsoft 365*). Approaches **C/D** therefore **fuzzy-match** your selection to MDA app names (case-insensitive substring, either direction) so a specific-app pick still scopes them. Very broad names (e.g. *Office*) may pull in several MDA apps — leave **All** for the full MDA picture.
+
+## Prerequisites
+
+- **Microsoft Entra ID P1/P2** with the **Entra ID** data connector enabled — provides `SigninLogs` and/or `AADNonInteractiveUserSignInLogs` (Approaches A/B).
+- **Microsoft Defender for Cloud Apps** connected to Sentinel — provides `CloudAppEvents` (Approaches C/D).
+- **Reader** on the target Log Analytics / Sentinel workspace.
+
+If a table shows *no data*, check the matching data-availability tile, widen the **Time Range**, or pick a different **Workspace**.
+
+## Deploy (Advanced Editor import)
+
+1. Open your Log Analytics workspace (or Microsoft Sentinel) in the Azure portal — or Microsoft Defender XDR (unified) if using the Defender portal.
+2. Go to **Workbooks → + New**, click **Edit**, then open the **Advanced Editor** (`</>`).
+3. Replace the contents with `Sentinel-Identity-Dashboard.workbook.json`, click **Apply**, then **Save** (e.g. *Verified SaaS Usage – Identity Journey*).
+4. Select the **Workspace** and **Time Range** pills, then use **User** / **Application** to focus.
 
 ## Known limitations
-- MDCA Cloud Discovery can show app/URL usage but is not proof of successful authentication.
-- CloudAppEvents coverage depends on app connector and telemetry availability.
-- Third-party app naming may differ between discovery and connected-app telemetry.
-- PingIdentity_CL is custom and may require schema mapping updates.
-- If country/department attributes are not present in Sentinel, enrich from UserInventory_CL or Entra/HR source.
 
-## Validate with sample applications
-Validate behavior for:
-- Ping Identity
-- Salesforce Marketing Cloud
-- Workday
-- Docker
-
-Recommended validation checks:
-1. Confirm each sample app appears in Cloud Discovery evidence where expected.
-2. Confirm verified classification only appears when CloudAppEvents or sign-in evidence exists.
-3. Confirm URL-only users are not counted as verified users.
-4. Confirm Last active and Total days used are populated correctly.
-5. Confirm Flexera export table returns expected columns and user-app records.
+- **Naming taxonomies differ** between Entra and MDA. The fuzzy bridge (above) reconciles most cases; a curated alias map is the follow-up if exact per-app parity is required.
+- **Non-Entra IdPs (e.g. PingID)** produce no Entra sign-in, so those apps appear **Unauthenticated** in Approach D even when the user really did authenticate. The workbook's *How the correlation works* section documents how to ingest PingID/other IdP logs and `union` them into the authentication set to correct this.
+- **Blank / GUID app names** on non-interactive sign-ins are backfilled from `ResourceDisplayName` then `AppId`, so you get a value instead of a blank.
+- Query-backed **parameter dropdowns** require the Log Analytics `queryType`/`resourceType` and bind to the selected **Workspace** — they populate only after Workspace + Time Range are set.
