@@ -1,6 +1,6 @@
 # Verified SaaS Usage – Identity Journey (Microsoft Sentinel Workbook)
 
-An Azure Monitor / Microsoft Sentinel workbook that answers one ITAM question for **cba**:
+An Azure Monitor / Microsoft Sentinel workbook that answers one IT Asset Management (ITAM) question:
 
 > *For each SaaS application, which users are really using it — and is that usage backed by a verified corporate sign-in (MFA / Conditional Access) or not?*
 
