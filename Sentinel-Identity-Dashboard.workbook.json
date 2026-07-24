@@ -35,6 +35,28 @@
             "value": null
           },
           {
+            "name": "MDCAWorkspace",
+            "version": "KqlParameterItem/1.0",
+            "label": "MDCA Default Workspace",
+            "type": 5,
+            "description": "Second Log Analytics workspace where MDCA / Defender (CloudAppEvents) data lands \u2014 used by the 'Entra \u00d7 MDCA (Default workspace)' section. Pick the DefaultWorkspace-\u2026 that ingests Defender data.",
+            "isRequired": true,
+            "multiSelect": false,
+            "quote": "",
+            "delimiter": ",",
+            "query": "resources\n| where type =~ 'microsoft.operationalinsights/workspaces'\n| project id, name\n| order by name asc",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": [],
+              "showDefault": false
+            },
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": null
+          },
+          {
             "name": "TimeRange",
             "label": "Time Range",
             "type": 4,
@@ -520,7 +542,7 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "let SelApps = CloudAppEvents\n| where isnotempty(Application)\n| distinct Application\n| extend _sel = dynamic([{Application}])\n| mv-apply _s = _sel to typeof(string) on (\n    summarize _hit = countif(_s == 'value::all' or _s == '*' or tolower(Application) == tolower(_s) or tolower(Application) contains tolower(_s) or tolower(_s) contains tolower(Application))\n  )\n| where _hit > 0\n| distinct Application;\nlet MdaUsage = CloudAppEvents\n    | extend AccId = tostring(column_ifexists('AccountId', ''))\n    | extend AccName = tostring(column_ifexists('AccountDisplayName', ''))\n    | extend UPN = iff(AccId has \"@\", tolower(AccId), tolower(AccName))\n    | extend UserKey = iff(isnotempty(tostring(column_ifexists('AccountObjectId', ''))), tolower(tostring(column_ifexists('AccountObjectId', ''))), UPN)\n    | where 'value::all' in ({Application}) or '*' in ({Application}) or Application in (SelApps)\n    | summarize MdaActivities = count(), LastActive = max(TimeGenerated), TotalDaysUsed = dcount(bin(TimeGenerated, 1d)), UPN = take_any(UPN)\n        by MdaApp = tolower(Application), UserKey;\nlet Auth = union isfuzzy=true (SigninLogs), (AADNonInteractiveUserSignInLogs)\n    | where ResultType == \"0\"\n    | extend UserKey = iff(isnotempty(tostring(column_ifexists('UserId', ''))), tolower(tostring(column_ifexists('UserId', ''))), tolower(UserPrincipalName))\n    | summarize SignIns = count(),\n        MFAHits = countif(AuthenticationRequirement == \"multiFactorAuthentication\"),\n        CAHits = countif(ConditionalAccessStatus == \"success\")\n        by EntraApp = tolower(AppDisplayName), UserKey;\nMdaUsage\n| join kind=leftouter (Auth) on UserKey\n| extend AppMatch = isnotempty(EntraApp) and (MdaApp == EntraApp or MdaApp contains EntraApp or EntraApp contains MdaApp)\n| summarize SignIns = sum(iff(AppMatch, SignIns, 0)), MFAHits = sum(iff(AppMatch, MFAHits, 0)), CAHits = sum(iff(AppMatch, CAHits, 0)) by Application = MdaApp, User = UPN, MdaActivities, TotalDaysUsed, LastActive\n| extend AccessType = iff(SignIns > 0, \"Authenticated\", \"Unauthenticated\")\n| extend MFA = iff(MFAHits > 0, \"Yes\", \"No\"), CAVerified = iff(CAHits > 0, \"Verified\", \"Not Applied\"), MDCAActivity = iff(LastActive > ago({TimeRange:seconds}s), \"Active\", \"Inactive\")\n| where '{User}' == '' or User contains '{User}'\n| where '{AccessType}' == \"All\" or AccessType == '{AccessType}'\n| project Application, User, AccessType, MFA, CAVerified, MdaActivities, TotalDaysUsed, LastActive, MDCAActivity\n| order by AccessType asc, MdaActivities desc\n| take 1000",
+        "query": "let nrm = (s:string) { tolower(replace_string(replace_string(replace_string(replace_string(s, ' ', ''), '-', ''), '_', ''), '.', '')) };\nlet SelApps = CloudAppEvents\n| where isnotempty(Application)\n| distinct Application\n| extend _sel = dynamic([{Application}])\n| mv-apply _s = _sel to typeof(string) on (\n    summarize _hit = countif(_s == 'value::all' or _s == '*' or tolower(Application) == tolower(_s) or tolower(Application) contains tolower(_s) or tolower(_s) contains tolower(Application))\n  )\n| where _hit > 0\n| distinct Application;\nlet MdaUsage = CloudAppEvents\n    | where 'value::all' in ({Application}) or '*' in ({Application}) or Application in (SelApps)\n    | extend AccOid = tolower(tostring(column_ifexists('AccountObjectId', '')))\n    | extend AccId = tostring(column_ifexists('AccountId', ''))\n    | extend AccName = tostring(column_ifexists('AccountDisplayName', ''))\n    | extend AccUpn = tolower(iff(AccId has '@', AccId, ''))\n    | extend UserKey = iff(isnotempty(AccOid), AccOid, iff(isnotempty(AccUpn), AccUpn, tolower(AccName)))\n    | extend DispUser = iff(isnotempty(AccUpn), AccUpn, AccName)\n    | summarize MdaActivities = count(), LastActive = max(TimeGenerated), TotalDaysUsed = dcount(bin(TimeGenerated, 1d)), User = take_any(DispUser)\n        by MdaApp = tolower(Application), NmMda = nrm(Application), UserKey;\nlet Auth = union isfuzzy=true (SigninLogs), (AADNonInteractiveUserSignInLogs)\n    | where ResultType == '0'\n    | extend Oid = tolower(tostring(column_ifexists('UserId', ''))), Upn = tolower(tostring(column_ifexists('UserPrincipalName', '')))\n    | summarize SignIns = count(), MFAHits = countif(AuthenticationRequirement == 'multiFactorAuthentication'), CAHits = countif(ConditionalAccessStatus == 'success'), LastSignIn = max(TimeGenerated)\n        by EntraApp = tolower(AppDisplayName), NmEntra = nrm(AppDisplayName), Oid, Upn\n    | mv-expand UserKey = pack_array(Oid, Upn) to typeof(string)\n    | where isnotempty(UserKey)\n    | summarize SignIns = sum(SignIns), MFAHits = sum(MFAHits), CAHits = sum(CAHits), LastSignIn = max(LastSignIn) by EntraApp, NmEntra, UserKey;\nMdaUsage\n| join kind=leftouter (Auth) on UserKey\n| extend AppMatch = isnotempty(NmEntra) and (NmMda == NmEntra or (strlen(NmMda) >= 4 and NmEntra contains NmMda) or (strlen(NmEntra) >= 4 and NmMda contains NmEntra))\n| summarize SignIns = sum(iff(AppMatch, SignIns, 0)), ExactHits = sum(iff(AppMatch and NmMda == NmEntra, SignIns, 0)), MFAHits = sum(iff(AppMatch, MFAHits, 0)), CAHits = sum(iff(AppMatch, CAHits, 0)), LastSignIn = max(iff(AppMatch, LastSignIn, datetime(null))) by Application = MdaApp, User, MdaActivities, TotalDaysUsed, LastActive\n| extend AccessType = iff(SignIns > 0, 'Authenticated', 'Unauthenticated')\n| extend Confidence = iff(ExactHits > 0, 'High', iff(SignIns > 0, 'Medium', '-'))\n| extend MFA = iff(MFAHits > 0, 'Yes', 'No'), CAVerified = iff(CAHits > 0, 'Verified', 'Not Applied'), MDCAActivity = iff(LastActive > ago({TimeRange:seconds}s), 'Active', 'Inactive')\n| where '{User}' == '' or User contains '{User}'\n| where '{AccessType}' == 'All' or AccessType == '{AccessType}'\n| project Application, User, AccessType, Confidence, MFA, CAVerified, MdaActivities, TotalDaysUsed, LastActive, LastSignIn, MDCAActivity\n| order by AccessType asc, MdaActivities desc\n| take 1000",
         "size": 0,
         "title": "Approach D – MDA \u00d7 Entra cross-reference · Authenticated vs Unauthenticated",
         "timeContext": {
@@ -624,6 +646,279 @@
         ]
       },
       "name": "approach-d-mda-entra-crossref"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## Entra \u00d7 MDCA \u2014 Sentinel workspace vs Default workspace\n\nApproaches **C/D** above read `CloudAppEvents` from the **selected Sentinel `{Workspace}`**. But MDCA / Defender for Cloud Apps data frequently lands in a **different Log Analytics workspace** (often a `DefaultWorkspace-\u2026` created automatically by Defender for Cloud). Pick that workspace in the **MDCA Default Workspace** filter at the top, then compare the two tables below to see **where the MDCA data actually exists** and how it correlates to Entra sign-ins.\n\n- **Entra \u00d7 MDCA (Sentinel table)** \u2014 `CloudAppEvents` from `{Workspace}` \u22c8 Entra sign-ins from `{Workspace}`.\n- **Entra \u00d7 MDCA (Default workspace)** \u2014 `CloudAppEvents` from the **MDCA Default Workspace** \u22c8 Entra sign-ins from `{Workspace}`, joined in one query via the KQL `workspace()` cross-workspace function.\n\n> The **data location** tile below shows `CloudAppEvents` row / user / app counts in **both** workspaces side by side \u2014 an empty side tells you MDCA is not ingesting there, so the corresponding cross-reference table will be blank."
+      },
+      "name": "dual-workspace-intro"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "union isfuzzy=true\n(workspace({Workspace}).CloudAppEvents | summarize Rows = count(), Users = dcount(AccountObjectId), Apps = dcount(Application) | extend Location = \"Sentinel (primary workspace)\"),\n(workspace('{MDCAWorkspace}').CloudAppEvents | summarize Rows = count(), Users = dcount(AccountObjectId), Apps = dcount(Application) | extend Location = \"MDCA Default workspace\")\n| project Location, Rows, Users, Apps\n| order by Location asc",
+        "size": 4,
+        "title": "MDCA data location \u2014 Sentinel workspace vs Default workspace (CloudAppEvents)",
+        "timeContext": {
+          "durationMs": 0
+        },
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Rows",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsStyle": "icons",
+                "thresholds": [
+                  {
+                    "operator": ">",
+                    "thresholdValue": "0",
+                    "representation": "2",
+                    "text": "{0}"
+                  },
+                  {
+                    "operator": "default",
+                    "thresholdValue": null,
+                    "representation": "4",
+                    "text": "{0} (no data)"
+                  }
+                ]
+              }
+            }
+          ],
+          "rowLimit": 10
+        },
+        "crossComponentResources": [
+          "{Workspace}",
+          "{MDCAWorkspace}"
+        ]
+      },
+      "name": "mdca-workspace-availability"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let nrm = (s:string) { tolower(replace_string(replace_string(replace_string(replace_string(s, ' ', ''), '-', ''), '_', ''), '.', '')) };\nlet SelApps = CloudAppEvents\n| where isnotempty(Application)\n| distinct Application\n| extend _sel = dynamic([{Application}])\n| mv-apply _s = _sel to typeof(string) on (\n    summarize _hit = countif(_s == 'value::all' or _s == '*' or tolower(Application) == tolower(_s) or tolower(Application) contains tolower(_s) or tolower(_s) contains tolower(Application))\n  )\n| where _hit > 0\n| distinct Application;\nlet MdaUsage = CloudAppEvents\n    | where 'value::all' in ({Application}) or '*' in ({Application}) or Application in (SelApps)\n    | extend AccOid = tolower(tostring(column_ifexists('AccountObjectId', '')))\n    | extend AccId = tostring(column_ifexists('AccountId', ''))\n    | extend AccName = tostring(column_ifexists('AccountDisplayName', ''))\n    | extend AccUpn = tolower(iff(AccId has '@', AccId, ''))\n    | extend UserKey = iff(isnotempty(AccOid), AccOid, iff(isnotempty(AccUpn), AccUpn, tolower(AccName)))\n    | extend DispUser = iff(isnotempty(AccUpn), AccUpn, AccName)\n    | summarize MdaActivities = count(), LastActive = max(TimeGenerated), TotalDaysUsed = dcount(bin(TimeGenerated, 1d)), User = take_any(DispUser)\n        by MdaApp = tolower(Application), NmMda = nrm(Application), UserKey;\nlet Auth = union isfuzzy=true (SigninLogs), (AADNonInteractiveUserSignInLogs)\n    | where ResultType == '0'\n    | extend Oid = tolower(tostring(column_ifexists('UserId', ''))), Upn = tolower(tostring(column_ifexists('UserPrincipalName', '')))\n    | summarize SignIns = count(), MFAHits = countif(AuthenticationRequirement == 'multiFactorAuthentication'), CAHits = countif(ConditionalAccessStatus == 'success'), LastSignIn = max(TimeGenerated)\n        by EntraApp = tolower(AppDisplayName), NmEntra = nrm(AppDisplayName), Oid, Upn\n    | mv-expand UserKey = pack_array(Oid, Upn) to typeof(string)\n    | where isnotempty(UserKey)\n    | summarize SignIns = sum(SignIns), MFAHits = sum(MFAHits), CAHits = sum(CAHits), LastSignIn = max(LastSignIn) by EntraApp, NmEntra, UserKey;\nMdaUsage\n| join kind=leftouter (Auth) on UserKey\n| extend AppMatch = isnotempty(NmEntra) and (NmMda == NmEntra or (strlen(NmMda) >= 4 and NmEntra contains NmMda) or (strlen(NmEntra) >= 4 and NmMda contains NmEntra))\n| summarize SignIns = sum(iff(AppMatch, SignIns, 0)), ExactHits = sum(iff(AppMatch and NmMda == NmEntra, SignIns, 0)), MFAHits = sum(iff(AppMatch, MFAHits, 0)), CAHits = sum(iff(AppMatch, CAHits, 0)), LastSignIn = max(iff(AppMatch, LastSignIn, datetime(null))) by Application = MdaApp, User, MdaActivities, TotalDaysUsed, LastActive\n| extend AccessType = iff(SignIns > 0, 'Authenticated', 'Unauthenticated')\n| extend Confidence = iff(ExactHits > 0, 'High', iff(SignIns > 0, 'Medium', '-'))\n| extend MFA = iff(MFAHits > 0, 'Yes', 'No'), CAVerified = iff(CAHits > 0, 'Verified', 'Not Applied'), MDCAActivity = iff(LastActive > ago({TimeRange:seconds}s), 'Active', 'Inactive')\n| where '{User}' == '' or User contains '{User}'\n| where '{AccessType}' == 'All' or AccessType == '{AccessType}'\n| project Application, User, AccessType, Confidence, MFA, CAVerified, MdaActivities, TotalDaysUsed, LastActive, LastSignIn, MDCAActivity\n| order by AccessType asc, MdaActivities desc\n| take 1000",
+        "size": 0,
+        "title": "Entra \u00d7 MDCA (Sentinel table) \u00b7 Authenticated vs Unauthenticated",
+        "timeContext": {
+          "durationMs": 0
+        },
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "AccessType",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsStyle": "icons",
+                "thresholds": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Authenticated",
+                    "representation": "2",
+                    "text": "{0}"
+                  },
+                  {
+                    "operator": "default",
+                    "thresholdValue": null,
+                    "representation": "4",
+                    "text": "{0}"
+                  }
+                ]
+              }
+            },
+            {
+              "columnMatch": "MFA",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsStyle": "icons",
+                "thresholds": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Yes",
+                    "representation": "2",
+                    "text": "{0}"
+                  },
+                  {
+                    "operator": "default",
+                    "thresholdValue": null,
+                    "representation": "4",
+                    "text": "{0}"
+                  }
+                ]
+              }
+            },
+            {
+              "columnMatch": "CAVerified",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsStyle": "icons",
+                "thresholds": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Verified",
+                    "representation": "2",
+                    "text": "{0}"
+                  },
+                  {
+                    "operator": "default",
+                    "thresholdValue": null,
+                    "representation": "1",
+                    "text": "{0}"
+                  }
+                ]
+              }
+            },
+            {
+              "columnMatch": "MDCAActivity",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsStyle": "icons",
+                "thresholds": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Active",
+                    "representation": "2",
+                    "text": "Active"
+                  },
+                  {
+                    "operator": "default",
+                    "thresholdValue": null,
+                    "representation": "3",
+                    "text": "Inactive"
+                  }
+                ]
+              }
+            }
+          ],
+          "rowLimit": 1000
+        },
+        "crossComponentResources": [
+          "{Workspace}"
+        ]
+      },
+      "name": "approach-e-entra-mdca-sentinel"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let nrm = (s:string) { tolower(replace_string(replace_string(replace_string(replace_string(s, ' ', ''), '-', ''), '_', ''), '.', '')) };\nlet SelApps = workspace('{MDCAWorkspace}').CloudAppEvents\n| where isnotempty(Application)\n| distinct Application\n| extend _sel = dynamic([{Application}])\n| mv-apply _s = _sel to typeof(string) on (\n    summarize _hit = countif(_s == 'value::all' or _s == '*' or tolower(Application) == tolower(_s) or tolower(Application) contains tolower(_s) or tolower(_s) contains tolower(Application))\n  )\n| where _hit > 0\n| distinct Application;\nlet MdaUsage = workspace('{MDCAWorkspace}').CloudAppEvents\n    | where 'value::all' in ({Application}) or '*' in ({Application}) or Application in (SelApps)\n    | extend AccOid = tolower(tostring(column_ifexists('AccountObjectId', '')))\n    | extend AccId = tostring(column_ifexists('AccountId', ''))\n    | extend AccName = tostring(column_ifexists('AccountDisplayName', ''))\n    | extend AccUpn = tolower(iff(AccId has '@', AccId, ''))\n    | extend UserKey = iff(isnotempty(AccOid), AccOid, iff(isnotempty(AccUpn), AccUpn, tolower(AccName)))\n    | extend DispUser = iff(isnotempty(AccUpn), AccUpn, AccName)\n    | summarize MdaActivities = count(), LastActive = max(TimeGenerated), TotalDaysUsed = dcount(bin(TimeGenerated, 1d)), User = take_any(DispUser)\n        by MdaApp = tolower(Application), NmMda = nrm(Application), UserKey;\nlet Auth = union isfuzzy=true (SigninLogs), (AADNonInteractiveUserSignInLogs)\n    | where ResultType == '0'\n    | extend Oid = tolower(tostring(column_ifexists('UserId', ''))), Upn = tolower(tostring(column_ifexists('UserPrincipalName', '')))\n    | summarize SignIns = count(), MFAHits = countif(AuthenticationRequirement == 'multiFactorAuthentication'), CAHits = countif(ConditionalAccessStatus == 'success'), LastSignIn = max(TimeGenerated)\n        by EntraApp = tolower(AppDisplayName), NmEntra = nrm(AppDisplayName), Oid, Upn\n    | mv-expand UserKey = pack_array(Oid, Upn) to typeof(string)\n    | where isnotempty(UserKey)\n    | summarize SignIns = sum(SignIns), MFAHits = sum(MFAHits), CAHits = sum(CAHits), LastSignIn = max(LastSignIn) by EntraApp, NmEntra, UserKey;\nMdaUsage\n| join kind=leftouter (Auth) on UserKey\n| extend AppMatch = isnotempty(NmEntra) and (NmMda == NmEntra or (strlen(NmMda) >= 4 and NmEntra contains NmMda) or (strlen(NmEntra) >= 4 and NmMda contains NmEntra))\n| summarize SignIns = sum(iff(AppMatch, SignIns, 0)), ExactHits = sum(iff(AppMatch and NmMda == NmEntra, SignIns, 0)), MFAHits = sum(iff(AppMatch, MFAHits, 0)), CAHits = sum(iff(AppMatch, CAHits, 0)), LastSignIn = max(iff(AppMatch, LastSignIn, datetime(null))) by Application = MdaApp, User, MdaActivities, TotalDaysUsed, LastActive\n| extend AccessType = iff(SignIns > 0, 'Authenticated', 'Unauthenticated')\n| extend Confidence = iff(ExactHits > 0, 'High', iff(SignIns > 0, 'Medium', '-'))\n| extend MFA = iff(MFAHits > 0, 'Yes', 'No'), CAVerified = iff(CAHits > 0, 'Verified', 'Not Applied'), MDCAActivity = iff(LastActive > ago({TimeRange:seconds}s), 'Active', 'Inactive')\n| where '{User}' == '' or User contains '{User}'\n| where '{AccessType}' == 'All' or AccessType == '{AccessType}'\n| project Application, User, AccessType, Confidence, MFA, CAVerified, MdaActivities, TotalDaysUsed, LastActive, LastSignIn, MDCAActivity\n| order by AccessType asc, MdaActivities desc\n| take 1000",
+        "size": 0,
+        "title": "Entra \u00d7 MDCA (Default workspace) \u00b7 Authenticated vs Unauthenticated",
+        "timeContext": {
+          "durationMs": 0
+        },
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "AccessType",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsStyle": "icons",
+                "thresholds": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Authenticated",
+                    "representation": "2",
+                    "text": "{0}"
+                  },
+                  {
+                    "operator": "default",
+                    "thresholdValue": null,
+                    "representation": "4",
+                    "text": "{0}"
+                  }
+                ]
+              }
+            },
+            {
+              "columnMatch": "MFA",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsStyle": "icons",
+                "thresholds": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Yes",
+                    "representation": "2",
+                    "text": "{0}"
+                  },
+                  {
+                    "operator": "default",
+                    "thresholdValue": null,
+                    "representation": "4",
+                    "text": "{0}"
+                  }
+                ]
+              }
+            },
+            {
+              "columnMatch": "CAVerified",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsStyle": "icons",
+                "thresholds": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Verified",
+                    "representation": "2",
+                    "text": "{0}"
+                  },
+                  {
+                    "operator": "default",
+                    "thresholdValue": null,
+                    "representation": "1",
+                    "text": "{0}"
+                  }
+                ]
+              }
+            },
+            {
+              "columnMatch": "MDCAActivity",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsStyle": "icons",
+                "thresholds": [
+                  {
+                    "operator": "==",
+                    "thresholdValue": "Active",
+                    "representation": "2",
+                    "text": "Active"
+                  },
+                  {
+                    "operator": "default",
+                    "thresholdValue": null,
+                    "representation": "3",
+                    "text": "Inactive"
+                  }
+                ]
+              }
+            }
+          ],
+          "rowLimit": 1000
+        },
+        "crossComponentResources": [
+          "{Workspace}",
+          "{MDCAWorkspace}"
+        ]
+      },
+      "name": "approach-f-entra-mdca-default"
     },
     {
       "type": 1,
